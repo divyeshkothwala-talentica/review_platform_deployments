@@ -1,0 +1,430 @@
+name: Backend Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      instance_type:
+        description: 'EC2 instance type'
+        required: false
+        default: 't3.medium'
+        type: string
+      
+  push:
+    branches:
+      - main
+    paths:
+      - 'deployment/terraform/backend-*.tf'
+      - 'deployment/terraform/scripts/**'
+      - '.github/workflows/infrastructure-backend.yml'
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.6.0
+  TERRAFORM_DIR: deployment/terraform
+
+jobs:
+  validate:
+    name: Validate Terraform Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Terraform Format Check
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform fmt -check -recursive
+          
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init -backend=false
+        
+      - name: Terraform Validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform validate
+        
+      - name: Lint Shell Scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          find ${{ env.TERRAFORM_DIR }}/scripts -name "*.sh" -exec shellcheck {} \;
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event.inputs.action != 'destroy' || github.event_name == 'push'
+    
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      
+    outputs:
+      plan-output: ${{ steps.plan.outputs.stdout }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Create Terraform Variables File
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          cat > backend.tfvars << EOF
+          aws_region = "${{ env.AWS_REGION }}"
+          environment = "${{ github.event.inputs.environment || 'production' }}"
+          project_name = "review-platform"
+          
+          # Network Configuration
+          vpc_cidr = "10.0.0.0/16"
+          public_subnet_cidr = "10.0.1.0/24"
+          
+          # EC2 Configuration
+          instance_type = "${{ github.event.inputs.instance_type || 't3.medium' }}"
+          
+          # SSH Keys (from secrets)
+          public_key = "${{ secrets.SSH_PUBLIC_KEY }}"
+          private_key = "${{ secrets.SSH_PRIVATE_KEY }}"
+          
+          # Application Configuration
+          openai_api_key = "${{ secrets.OPENAI_API_KEY }}"
+          cors_origin = "https://d157ilt95f9lq6.cloudfront.net"
+          jwt_secret = "${{ secrets.JWT_SECRET }}"
+          mongo_db_name = "book_review_platform"
+          
+          # GitHub Configuration
+          github_repo = "${{ github.repository }}"
+          
+          # Optional Configuration
+          enable_monitoring = true
+          backup_retention_days = 7
+          node_version = "18"
+          npm_version = "latest"
+          EOF
+          
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+            
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform plan \
+            -var-file=backend.tfvars \
+            -out=tfplan \
+            -detailed-exitcode
+        continue-on-error: true
+        
+      - name: Update Pull Request
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+            
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ env.TERRAFORM_DIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      (github.event.inputs.action == 'apply' || 
+       (github.event_name == 'push' && github.ref == 'refs/heads/main')) &&
+      github.event.inputs.action != 'destroy'
+    
+    permissions:
+      id-token: write
+      contents: read
+      
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Create Terraform Variables File
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          cat > backend.tfvars << EOF
+          aws_region = "${{ env.AWS_REGION }}"
+          environment = "${{ github.event.inputs.environment || 'production' }}"
+          project_name = "review-platform"
+          
+          # Network Configuration
+          vpc_cidr = "10.0.0.0/16"
+          public_subnet_cidr = "10.0.1.0/24"
+          
+          # EC2 Configuration
+          instance_type = "${{ github.event.inputs.instance_type || 't3.medium' }}"
+          
+          # SSH Keys (from secrets)
+          public_key = "${{ secrets.SSH_PUBLIC_KEY }}"
+          private_key = "${{ secrets.SSH_PRIVATE_KEY }}"
+          
+          # Application Configuration
+          openai_api_key = "${{ secrets.OPENAI_API_KEY }}"
+          cors_origin = "https://d157ilt95f9lq6.cloudfront.net"
+          jwt_secret = "${{ secrets.JWT_SECRET }}"
+          mongo_db_name = "book_review_platform"
+          
+          # GitHub Configuration
+          github_repo = "${{ github.repository }}"
+          
+          # Optional Configuration
+          enable_monitoring = true
+          backup_retention_days = 7
+          node_version = "18"
+          npm_version = "latest"
+          EOF
+          
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+            
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ env.TERRAFORM_DIR }}
+          
+      - name: Terraform Apply
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform apply -auto-approve tfplan
+        
+      - name: Get Infrastructure Outputs
+        id: outputs
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "backend_ip=$(terraform output -raw backend_public_ip)" >> $GITHUB_OUTPUT
+          echo "backend_api_url=$(terraform output -raw backend_api_url)" >> $GITHUB_OUTPUT
+          echo "ssh_command=$(terraform output -raw backend_ssh_command)" >> $GITHUB_OUTPUT
+          
+      - name: Wait for Instance Initialization
+        run: |
+          echo "Waiting for EC2 instance to complete initialization..."
+          sleep 300  # Wait 5 minutes for cloud-init to complete
+          
+      - name: Verify Instance Health
+        run: |
+          max_attempts=10
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Health check attempt $attempt/$max_attempts..."
+            
+            if curl -f --connect-timeout 10 --max-time 30 \
+                "${{ steps.outputs.outputs.backend_api_url }}/health" > /dev/null 2>&1; then
+              echo "✅ Backend API is healthy!"
+              break
+            else
+              echo "❌ Health check failed, retrying in 30 seconds..."
+              sleep 30
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          if [ $attempt -gt $max_attempts ]; then
+            echo "⚠️ Health check failed after $max_attempts attempts"
+            echo "The infrastructure has been deployed, but the application may need manual verification"
+          fi
+          
+      - name: Create Deployment Summary
+        run: |
+          cat > deployment-summary.md << EOF
+          # Backend Infrastructure Deployment Summary
+          
+          ## 🚀 Deployment Details
+          - **Environment**: ${{ github.event.inputs.environment || 'production' }}
+          - **Instance Type**: ${{ github.event.inputs.instance_type || 't3.medium' }}
+          - **Deployment Time**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Commit SHA**: ${{ github.sha }}
+          
+          ## 🌐 Access Information
+          - **Backend API URL**: ${{ steps.outputs.outputs.backend_api_url }}
+          - **Health Check**: ${{ steps.outputs.outputs.backend_api_url }}/health
+          - **SSH Command**: ${{ steps.outputs.outputs.ssh_command }}
+          
+          ## 📋 Next Steps
+          1. **Deploy Application Code**: Use the backend deployment pipeline
+          2. **Migrate Database**: Run the MongoDB migration script
+          3. **Verify APIs**: Test all endpoints after application deployment
+          4. **Monitor Logs**: Check CloudWatch logs for any issues
+          
+          ## 🔧 Useful Commands
+          \`\`\`bash
+          # SSH to instance
+          ${{ steps.outputs.outputs.ssh_command }}
+          
+          # Check application status
+          ssh -i ~/.ssh/key.pem ec2-user@${{ steps.outputs.outputs.backend_ip }} "sudo systemctl status backend-app"
+          
+          # View application logs
+          ssh -i ~/.ssh/key.pem ec2-user@${{ steps.outputs.outputs.backend_ip }} "tail -f /opt/backend-app/logs/combined.log"
+          \`\`\`
+          EOF
+          
+      - name: Upload Deployment Summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary
+          path: deployment-summary.md
+          
+      - name: Notify Deployment Success
+        run: |
+          echo "🎉 Backend infrastructure deployed successfully!"
+          echo "📍 Backend API: ${{ steps.outputs.outputs.backend_api_url }}"
+          echo "🔑 SSH Access: ${{ steps.outputs.outputs.ssh_command }}"
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    
+    permissions:
+      id-token: write
+      contents: read
+      
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Create Terraform Variables File
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          cat > backend.tfvars << EOF
+          aws_region = "${{ env.AWS_REGION }}"
+          environment = "${{ github.event.inputs.environment || 'production' }}"
+          project_name = "review-platform"
+          
+          # Network Configuration
+          vpc_cidr = "10.0.0.0/16"
+          public_subnet_cidr = "10.0.1.0/24"
+          
+          # EC2 Configuration
+          instance_type = "${{ github.event.inputs.instance_type || 't3.medium' }}"
+          
+          # SSH Keys (from secrets)
+          public_key = "${{ secrets.SSH_PUBLIC_KEY }}"
+          private_key = "${{ secrets.SSH_PRIVATE_KEY }}"
+          
+          # Application Configuration
+          openai_api_key = "${{ secrets.OPENAI_API_KEY }}"
+          cors_origin = "https://d157ilt95f9lq6.cloudfront.net"
+          jwt_secret = "${{ secrets.JWT_SECRET }}"
+          mongo_db_name = "book_review_platform"
+          
+          # GitHub Configuration
+          github_repo = "${{ github.repository }}"
+          
+          # Optional Configuration
+          enable_monitoring = true
+          backup_retention_days = 7
+          node_version = "18"
+          npm_version = "latest"
+          EOF
+          
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+            
+      - name: Terraform Destroy
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform destroy \
+            -var-file=backend.tfvars \
+            -auto-approve

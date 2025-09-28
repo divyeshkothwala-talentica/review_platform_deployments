@@ -1,0 +1,156 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'deployment/terraform/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'deployment/terraform/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.5.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Format Check
+        working-directory: ./deployment/terraform
+        run: terraform fmt -check
+      
+      - name: Terraform Init
+        working-directory: ./deployment/terraform
+        run: terraform init
+      
+      - name: Terraform Validate
+        working-directory: ./deployment/terraform
+        run: terraform validate
+      
+      - name: Terraform Plan
+        working-directory: ./deployment/terraform
+        run: |
+          terraform plan \
+            -var="bucket_name=${{ secrets.S3_BUCKET_NAME }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -var="environment=${{ secrets.ENVIRONMENT }}" \
+            -out=tfplan
+      
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: ./deployment/terraform/tfplan
+          retention-days: 5
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Init
+        working-directory: ./deployment/terraform
+        run: terraform init
+      
+      - name: Terraform Apply
+        working-directory: ./deployment/terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="bucket_name=${{ secrets.S3_BUCKET_NAME }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -var="environment=${{ secrets.ENVIRONMENT }}"
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Terraform Init
+        working-directory: ./deployment/terraform
+        run: terraform init
+      
+      - name: Terraform Destroy
+        working-directory: ./deployment/terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="bucket_name=${{ secrets.S3_BUCKET_NAME }}" \
+            -var="github_repo=${{ github.repository }}" \
+            -var="environment=${{ secrets.ENVIRONMENT }}"

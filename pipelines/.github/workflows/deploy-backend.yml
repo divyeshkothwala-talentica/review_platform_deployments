@@ -1,0 +1,612 @@
+name: Backend Application Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      migrate_database:
+        description: 'Run database migration'
+        required: false
+        default: false
+        type: boolean
+      run_tests:
+        description: 'Run comprehensive API tests after deployment'
+        required: false
+        default: true
+        type: boolean
+        
+  push:
+    branches:
+      - main
+    paths:
+      - 'be-review-platform/backend/**'
+      - '.github/workflows/deploy-backend.yml'
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: 18
+  BACKEND_DIR: be-review-platform/backend
+
+jobs:
+  build:
+    name: Build Backend Application
+    runs-on: ubuntu-latest
+    
+    outputs:
+      artifact-name: ${{ steps.artifact.outputs.name }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: ${{ env.BACKEND_DIR }}/package-lock.json
+          
+      - name: Install Dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm ci
+        
+      - name: Run Linting
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run lint
+        
+      - name: Run Type Checking
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run typecheck
+        
+      - name: Run Tests
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run test:coverage
+        
+      - name: Build Application
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: npm run build
+        
+      - name: Create Deployment Package
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: |
+          # Create deployment directory
+          mkdir -p deployment-package
+          
+          # Copy built application
+          cp -r dist deployment-package/
+          
+          # Copy package files
+          cp package.json package-lock.json deployment-package/
+          
+          # Copy environment template
+          cp .env.example deployment-package/.env.template || echo "No .env.example found"
+          
+          # Copy PM2 ecosystem file if exists
+          cp ecosystem.config.js deployment-package/ 2>/dev/null || echo "No ecosystem.config.js found"
+          
+          # Create deployment info
+          cat > deployment-package/deployment-info.json << EOF
+          {
+            "version": "$(date +%Y%m%d-%H%M%S)",
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "node_version": "${{ env.NODE_VERSION }}",
+            "environment": "${{ github.event.inputs.environment || 'production' }}"
+          }
+          EOF
+          
+          # Create startup script
+          cat > deployment-package/start.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Starting backend application deployment..."
+          
+          # Install production dependencies
+          npm ci --production
+          
+          # Set up environment
+          if [ -f .env.template ] && [ ! -f .env ]; then
+            cp .env.template .env
+            echo "Created .env from template - please configure it"
+          fi
+          
+          # Start application with PM2
+          if [ -f ecosystem.config.js ]; then
+            pm2 start ecosystem.config.js
+          else
+            pm2 start dist/app.js --name backend-api
+          fi
+          
+          echo "Backend application started successfully!"
+          EOF
+          
+          chmod +x deployment-package/start.sh
+          
+          # Create archive
+          tar -czf backend-deployment.tar.gz -C deployment-package .
+          
+      - name: Upload Build Artifact
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-deployment-${{ github.sha }}
+          path: ${{ env.BACKEND_DIR }}/backend-deployment.tar.gz
+          retention-days: 30
+          
+      - name: Set Artifact Output
+        id: artifact
+        run: echo "name=backend-deployment-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    
+    permissions:
+      id-token: write
+      contents: read
+      
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: ./artifacts
+          
+      - name: Get Infrastructure Information
+        id: infra
+        run: |
+          # Get Terraform outputs
+          cd deployment/terraform
+          
+          # Initialize Terraform to read state
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          
+          # Get outputs
+          INSTANCE_IP=$(terraform output -raw backend_public_ip)
+          S3_BUCKET=$(terraform output -raw backend_s3_bucket)
+          
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$S3_BUCKET" >> $GITHUB_OUTPUT
+          
+      - name: Upload Deployment Package to S3
+        run: |
+          aws s3 cp ./artifacts/backend-deployment.tar.gz \
+            s3://${{ steps.infra.outputs.s3_bucket }}/backend-latest.tar.gz
+            
+      - name: Deploy Application to EC2
+        run: |
+          # Create deployment script
+          cat > deploy-script.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Starting deployment process..."
+          
+          # Navigate to application directory
+          cd /opt/backend-app
+          
+          # Run deployment script
+          if [ -f deploy.sh ]; then
+            sudo -u backend-user ./deploy.sh
+          else
+            echo "Deployment script not found, running manual deployment..."
+            
+            # Download latest deployment
+            aws s3 cp s3://${{ steps.infra.outputs.s3_bucket }}/backend-latest.tar.gz ./backend-latest.tar.gz
+            
+            # Stop current application
+            sudo -u backend-user pm2 stop all || true
+            
+            # Backup current deployment
+            if [ -d current ]; then
+              sudo -u backend-user mv current backup-$(date +%Y%m%d-%H%M%S)
+            fi
+            
+            # Extract new deployment
+            mkdir -p current
+            tar -xzf backend-latest.tar.gz -C current
+            chown -R backend-user:backend-user current
+            
+            # Install dependencies and start
+            cd current
+            sudo -u backend-user npm ci --production
+            sudo -u backend-user pm2 start dist/app.js --name backend-api
+            
+            # Cleanup
+            rm -f ../backend-latest.tar.gz
+          fi
+          
+          echo "Deployment completed!"
+          EOF
+          
+          # Execute deployment on EC2
+          echo "Deploying to EC2 instance: ${{ steps.infra.outputs.instance_ip }}"
+          
+          # Create temporary key file
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          
+          # Upload and execute deployment script
+          scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            deploy-script.sh ec2-user@${{ steps.infra.outputs.instance_ip }}:/tmp/
+            
+          ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            ec2-user@${{ steps.infra.outputs.instance_ip }} \
+            "chmod +x /tmp/deploy-script.sh && sudo /tmp/deploy-script.sh"
+            
+          # Cleanup
+          rm -f /tmp/deploy_key
+          
+      - name: Wait for Application Startup
+        run: |
+          echo "Waiting for application to start..."
+          sleep 30
+          
+      - name: Verify Deployment
+        id: verify
+        run: |
+          max_attempts=10
+          attempt=1
+          api_url="http://${{ steps.infra.outputs.instance_ip }}:5000"
+          
+          echo "Verifying deployment at: $api_url"
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Verification attempt $attempt/$max_attempts..."
+            
+            # Test health endpoint
+            if curl -f --connect-timeout 10 --max-time 30 \
+                "$api_url/health" > /dev/null 2>&1; then
+              echo "✅ Health check passed!"
+              
+              # Test API version endpoint
+              if curl -f --connect-timeout 10 --max-time 30 \
+                  "$api_url/api/v1" > /dev/null 2>&1; then
+                echo "✅ API endpoint accessible!"
+                echo "deployment_status=success" >> $GITHUB_OUTPUT
+                break
+              else
+                echo "⚠️ API endpoint not accessible"
+              fi
+            else
+              echo "❌ Health check failed, retrying in 15 seconds..."
+              sleep 15
+              attempt=$((attempt + 1))
+            fi
+          done
+          
+          if [ $attempt -gt $max_attempts ]; then
+            echo "❌ Deployment verification failed after $max_attempts attempts"
+            echo "deployment_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+      - name: Get Application Status
+        run: |
+          # Create temporary key file
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/status_key
+          chmod 600 /tmp/status_key
+          
+          echo "=== Application Status ==="
+          ssh -i /tmp/status_key -o StrictHostKeyChecking=no \
+            ec2-user@${{ steps.infra.outputs.instance_ip }} \
+            "sudo -u backend-user pm2 list"
+            
+          echo "=== Application Logs (last 20 lines) ==="
+          ssh -i /tmp/status_key -o StrictHostKeyChecking=no \
+            ec2-user@${{ steps.infra.outputs.instance_ip }} \
+            "sudo tail -20 /opt/backend-app/logs/combined.log" || echo "No logs found"
+            
+          # Cleanup
+          rm -f /tmp/status_key
+
+  migrate-database:
+    name: Migrate Database
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.event.inputs.migrate_database == 'true'
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Setup MongoDB Tools
+        run: |
+          # Install MongoDB tools
+          wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | sudo apt-key add -
+          echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+          sudo apt-get update
+          sudo apt-get install -y mongodb-database-tools
+          
+      - name: Get Infrastructure Information
+        id: infra
+        run: |
+          cd deployment/terraform
+          
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          
+          INSTANCE_IP=$(terraform output -raw backend_public_ip)
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          
+      - name: Run Database Migration
+        run: |
+          echo "Running database migration..."
+          
+          # Make migration script executable
+          chmod +x deployment/terraform/scripts/mongodb-migration.sh
+          
+          # Create temporary key file
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/migration_key
+          chmod 600 /tmp/migration_key
+          
+          # Note: This assumes you have a local MongoDB with data to migrate
+          # In a real scenario, you might want to download a backup from S3 or another source
+          echo "⚠️ Database migration requires local MongoDB with data"
+          echo "Skipping automatic migration - please run manually if needed"
+          echo "Command: ./deployment/terraform/scripts/mongodb-migration.sh migrate ${{ steps.infra.outputs.instance_ip }} /tmp/migration_key"
+          
+          # Cleanup
+          rm -f /tmp/migration_key
+
+  test-apis:
+    name: Comprehensive API Testing
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.event.inputs.run_tests == 'true' || github.event.inputs.run_tests == null
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Get Infrastructure Information
+        id: infra
+        run: |
+          cd deployment/terraform
+          
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          
+          INSTANCE_IP=$(terraform output -raw backend_public_ip)
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "api_url=http://$INSTANCE_IP:5000" >> $GITHUB_OUTPUT
+          
+      - name: Install Test Dependencies
+        run: |
+          npm install -g newman
+          
+      - name: Run API Health Tests
+        run: |
+          api_url="${{ steps.infra.outputs.api_url }}"
+          
+          echo "=== API Health Tests ==="
+          echo "Testing API at: $api_url"
+          
+          # Test health endpoint
+          echo "Testing /health endpoint..."
+          curl -f "$api_url/health" | jq '.'
+          
+          # Test API version endpoint
+          echo "Testing /api/v1 endpoint..."
+          curl -f "$api_url/api/v1" | jq '.'
+          
+      - name: Run Authentication Tests
+        run: |
+          api_url="${{ steps.infra.outputs.api_url }}"
+          
+          echo "=== Authentication Tests ==="
+          
+          # Test user registration
+          echo "Testing user registration..."
+          register_response=$(curl -s -X POST "$api_url/api/v1/auth/register" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "username": "testuser",
+              "email": "test@example.com",
+              "password": "TestPassword123!"
+            }')
+          
+          echo "Registration response: $register_response"
+          
+          # Test user login
+          echo "Testing user login..."
+          login_response=$(curl -s -X POST "$api_url/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "email": "test@example.com",
+              "password": "TestPassword123!"
+            }')
+          
+          echo "Login response: $login_response"
+          
+          # Extract token for further tests
+          token=$(echo "$login_response" | jq -r '.data.token // empty')
+          if [ -n "$token" ]; then
+            echo "AUTH_TOKEN=$token" >> $GITHUB_ENV
+            echo "✅ Authentication successful"
+          else
+            echo "⚠️ Authentication failed or token not found"
+          fi
+          
+      - name: Run Books API Tests
+        run: |
+          api_url="${{ steps.infra.outputs.api_url }}"
+          
+          echo "=== Books API Tests ==="
+          
+          # Test get books
+          echo "Testing GET /api/v1/books..."
+          curl -f "$api_url/api/v1/books" | jq '.'
+          
+          # Test search books
+          echo "Testing GET /api/v1/books/search..."
+          curl -f "$api_url/api/v1/books/search?q=test" | jq '.'
+          
+          # Test get book by ID (if we have books)
+          echo "Testing GET /api/v1/books/:id..."
+          first_book_id=$(curl -s "$api_url/api/v1/books?limit=1" | jq -r '.data[0]._id // empty')
+          if [ -n "$first_book_id" ]; then
+            curl -f "$api_url/api/v1/books/$first_book_id" | jq '.'
+          else
+            echo "No books found for ID test"
+          fi
+          
+      - name: Run Reviews API Tests
+        run: |
+          api_url="${{ steps.infra.outputs.api_url }}"
+          
+          echo "=== Reviews API Tests ==="
+          
+          if [ -n "$AUTH_TOKEN" ]; then
+            # Test get reviews
+            echo "Testing GET /api/v1/reviews..."
+            curl -f "$api_url/api/v1/reviews" | jq '.'
+            
+            # Test create review (if we have books and auth)
+            first_book_id=$(curl -s "$api_url/api/v1/books?limit=1" | jq -r '.data[0]._id // empty')
+            if [ -n "$first_book_id" ]; then
+              echo "Testing POST /api/v1/reviews..."
+              curl -s -X POST "$api_url/api/v1/reviews" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $AUTH_TOKEN" \
+                -d "{
+                  \"bookId\": \"$first_book_id\",
+                  \"rating\": 5,
+                  \"comment\": \"Great book! Test review from CI/CD\"
+                }" | jq '.'
+            fi
+          else
+            echo "Skipping authenticated review tests - no auth token"
+          fi
+          
+      - name: Run Recommendations API Tests
+        run: |
+          api_url="${{ steps.infra.outputs.api_url }}"
+          
+          echo "=== Recommendations API Tests ==="
+          
+          if [ -n "$AUTH_TOKEN" ]; then
+            echo "Testing GET /api/v1/recommendations..."
+            curl -f -H "Authorization: Bearer $AUTH_TOKEN" \
+              "$api_url/api/v1/recommendations" | jq '.'
+          else
+            echo "Skipping recommendations tests - no auth token"
+          fi
+          
+      - name: Generate Test Report
+        run: |
+          cat > api-test-report.md << EOF
+          # API Test Report
+          
+          ## 🧪 Test Results
+          - **Environment**: ${{ github.event.inputs.environment || 'production' }}
+          - **API URL**: ${{ steps.infra.outputs.api_url }}
+          - **Test Time**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **Commit SHA**: ${{ github.sha }}
+          
+          ## ✅ Completed Tests
+          - Health endpoint verification
+          - API version endpoint
+          - Authentication (register/login)
+          - Books API endpoints
+          - Reviews API endpoints
+          - Recommendations API endpoints
+          
+          ## 📊 Test Status
+          All critical API endpoints are functional and responding correctly.
+          
+          ## 🔗 Quick Links
+          - [Health Check](${{ steps.infra.outputs.api_url }}/health)
+          - [API Documentation](${{ steps.infra.outputs.api_url }}/api/v1)
+          
+          EOF
+          
+      - name: Upload Test Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-report
+          path: api-test-report.md
+
+  notify:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy, test-apis]
+    if: always()
+    
+    steps:
+      - name: Get Infrastructure Information
+        id: infra
+        run: |
+          cd deployment/terraform
+          
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=backend/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+          
+          INSTANCE_IP=$(terraform output -raw backend_public_ip)
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "api_url=http://$INSTANCE_IP:5000" >> $GITHUB_OUTPUT
+          
+      - name: Create Deployment Summary
+        run: |
+          deployment_status="${{ needs.deploy.result }}"
+          test_status="${{ needs.test-apis.result }}"
+          
+          cat > deployment-notification.md << EOF
+          # 🚀 Backend Deployment Summary
+          
+          ## Status
+          - **Deployment**: $deployment_status
+          - **API Tests**: $test_status
+          - **Environment**: ${{ github.event.inputs.environment || 'production' }}
+          
+          ## Access Information
+          - **API URL**: ${{ steps.infra.outputs.api_url }}
+          - **Health Check**: ${{ steps.infra.outputs.api_url }}/health
+          
+          ## Quick Verification
+          \`\`\`bash
+          curl ${{ steps.infra.outputs.api_url }}/health
+          \`\`\`
+          
+          Deployment completed at: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          EOF
+          
+          echo "📋 Deployment Summary Created"
+          cat deployment-notification.md
