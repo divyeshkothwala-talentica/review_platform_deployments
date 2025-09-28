@@ -11,6 +11,7 @@ The deployment architecture consists of:
 - **Infrastructure**: Terraform for Infrastructure as Code
 - **CI/CD**: GitHub Actions for automated deployments
 - **Security**: IAM roles and policies for secure deployments
+- **Management**: AWS Systems Manager for secure instance access
 
 ## 📁 Directory Structure
 
@@ -29,6 +30,8 @@ deployment/
 ├── scripts/                  # Deployment scripts
 │   ├── setup-infrastructure.sh   # Infrastructure setup
 │   ├── deploy-frontend.sh        # Frontend deployment
+│   ├── configure-ssm.sh          # AWS Systems Manager setup
+│   ├── verify-ssm-status.sh      # SSM status verification
 │   └── test-backend-apis.sh      # Backend API testing
 ├── config/                   # Configuration files
 └── docs/                     # Documentation
@@ -81,7 +84,15 @@ cd scripts
 
 **Backend Deployment:**
 - Backend is deployed on EC2 instance via Terraform
-- API endpoints available at: http://43.205.211.216:5000
+- API endpoints available at: https://44.194.207.22
+- Secure access via AWS Systems Manager Session Manager
+
+**AWS Systems Manager Setup:**
+```bash
+cd scripts
+./configure-ssm.sh
+./verify-ssm-status.sh
+```
 
 ## 🔧 Configuration
 

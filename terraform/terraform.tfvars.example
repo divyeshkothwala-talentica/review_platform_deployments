@@ -1,0 +1,16 @@
+# AWS Configuration
+aws_region = "us-east-1"
+environment = "dev"
+
+# Project Configuration
+project_name = "review-platform-frontend"
+bucket_name = "review-platform-frontend-dev-unique-suffix"
+
+# CloudFront Configuration
+cloudfront_price_class = "PriceClass_100"
+
+# GitHub Configuration (for CI/CD)
+github_repo = "your-username/your-repo-name"
+
+# Backend Configuration
+backend_api_url = "http://43.205.211.216:5000"

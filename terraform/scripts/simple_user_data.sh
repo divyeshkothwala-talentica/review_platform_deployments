@@ -17,6 +17,21 @@ dnf update -y
 log "Installing essential packages..."
 dnf install -y git curl wget unzip tar gcc-c++ make python3 python3-pip
 
+# Install and configure AWS Systems Manager Agent
+log "Installing AWS Systems Manager Agent..."
+dnf install -y amazon-ssm-agent
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+# Verify SSM agent installation
+log "Verifying SSM agent installation..."
+if systemctl is-active --quiet amazon-ssm-agent; then
+    log "AWS Systems Manager Agent is running successfully"
+else
+    log "ERROR: AWS Systems Manager Agent failed to start"
+    systemctl status amazon-ssm-agent
+fi
+
 # Install Node.js 18.x using NodeSource repository
 log "Installing Node.js 18.x..."
 curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
@@ -119,6 +134,7 @@ cat > /opt/backend-app/status.json << EOF
   "node_version": "$node_version",
   "npm_version": "$npm_version",
   "mongodb_status": "$(systemctl is-active mongod)",
+  "ssm_agent_status": "$(systemctl is-active amazon-ssm-agent)",
   "ready_for_deployment": true
 }
 EOF

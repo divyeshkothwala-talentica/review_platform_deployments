@@ -63,6 +63,16 @@ output "backend_instance_profile_arn" {
   value       = aws_iam_instance_profile.backend_ec2_profile.arn
 }
 
+output "ssm_session_manager_url" {
+  description = "AWS Console URL for Session Manager access to the instance"
+  value       = "https://console.aws.amazon.com/systems-manager/session-manager/${aws_instance.backend_instance.id}?region=${var.aws_region}"
+}
+
+output "ssm_connect_command" {
+  description = "AWS CLI command to connect via Session Manager"
+  value       = "aws ssm start-session --target ${aws_instance.backend_instance.id} --region ${var.aws_region}"
+}
+
 output "mongodb_connection_string" {
   description = "MongoDB connection string for the application"
   value       = "mongodb://localhost:27017/${var.mongo_db_name}"
@@ -81,6 +91,10 @@ output "deployment_instructions" {
     
     SSH Access:
     ssh -i ~/.ssh/your-key.pem ec2-user@${aws_eip.backend_eip.public_ip}
+    
+    AWS Systems Manager Access:
+    aws ssm start-session --target ${aws_instance.backend_instance.id} --region ${var.aws_region}
+    Console: https://console.aws.amazon.com/systems-manager/session-manager/${aws_instance.backend_instance.id}?region=${var.aws_region}
     
     Next Steps:
     1. Wait for the instance to complete initialization (check cloud-init logs)

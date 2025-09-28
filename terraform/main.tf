@@ -94,13 +94,31 @@ resource "aws_security_group" "backend_sg" {
   description = "Security group for backend EC2 instance"
   vpc_id      = aws_vpc.backend_vpc.id
 
-  # HTTP access for the API
+  # HTTPS access for the API (with self-signed certificate)
   ingress {
     from_port   = 5000
     to_port     = 5000
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Backend API access"
+    description = "Backend API HTTPS access"
+  }
+
+  # Standard HTTPS port
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Standard HTTPS access"
+  }
+
+  # HTTP port 80 for health checks and redirects
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP health checks and redirects"
   }
 
   # Alternative port for API
@@ -246,6 +264,12 @@ resource "aws_iam_policy" "backend_ec2_policy" {
 resource "aws_iam_role_policy_attachment" "backend_ec2_policy_attachment" {
   role       = aws_iam_role.backend_ec2_role.name
   policy_arn = aws_iam_policy.backend_ec2_policy.arn
+}
+
+# Attach AWS Systems Manager managed policy to EC2 role
+resource "aws_iam_role_policy_attachment" "backend_ec2_ssm_policy_attachment" {
+  role       = aws_iam_role.backend_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 # IAM instance profile
